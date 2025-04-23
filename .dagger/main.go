@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 )
 
 // to-do: update registry to v3
@@ -58,6 +59,7 @@ func (m *Harbor) PublishAndSignAllImages(
 	ctx context.Context,
 	registry string,
 	registryUsername string,
+	projectName string,
 	registryPassword *dagger.Secret,
 	imageTags []string,
 	// +optional
@@ -67,7 +69,7 @@ func (m *Harbor) PublishAndSignAllImages(
 	// +optional
 	actionsIdTokenRequestUrl string,
 ) (string, error) {
-	imageAddrs := m.PublishAllImages(ctx, registry, registryUsername, imageTags, registryPassword)
+	imageAddrs := m.PublishAllImages(ctx, registry, registryUsername, projectName, imageTags, registryPassword)
 	_, err := m.Sign(
 		ctx,
 		githubToken,
@@ -126,7 +128,7 @@ func (m *Harbor) Sign(ctx context.Context,
 // Publishes All Images and variants
 func (m *Harbor) PublishAllImages(
 	ctx context.Context,
-	registry, registryUsername string,
+	registry, registryUsername, projectName string,
 	imageTags []string,
 	registryPassword *dagger.Secret,
 ) []string {
@@ -143,11 +145,11 @@ func (m *Harbor) PublishAllImages(
 		for _, imageTag := range imageTags {
 			container := dag.Container().WithRegistryAuth(registry, registryUsername, registryPassword)
 			imgAddress, err := container.Publish(ctx,
-				fmt.Sprintf("%s/%s/%s:%s", registry, "harbor-next", pkg, imageTag),
+				fmt.Sprintf("%s/%s/%s:%s", registry, projectName, pkg, imageTag),
 				dagger.ContainerPublishOpts{PlatformVariants: imgs},
 			)
 			if err != nil {
-				fmt.Printf("Failed to publish image: %s/%s/%s:%s\n", registry, "harbor-next", pkg, imageTag)
+				fmt.Printf("Failed to publish image: %s/%s/%s:%s\n", registry, projectName, pkg, imageTag)
 				fmt.Printf("Error: %s\n", err)
 				continue
 			}
@@ -161,7 +163,7 @@ func (m *Harbor) PublishAllImages(
 // publishes the specific image with the given tag
 func (m *Harbor) PublishImage(
 	ctx context.Context,
-	registry, registryUsername string,
+	registry, registryUsername, projectName string,
 	imageTags []string,
 	pkg Package,
 	registryPassword *dagger.Secret,
@@ -187,11 +189,11 @@ func (m *Harbor) PublishImage(
 		for _, imageTag := range imageTags {
 			container := dag.Container().WithRegistryAuth(registry, registryUsername, registryPassword)
 			imgAddress, err := container.Publish(ctx,
-				fmt.Sprintf("%s/%s/%s:%s", registry, "harbor-next", pkg, imageTag),
+				fmt.Sprintf("%s/%s/%s:%s", registry, projectName, pkg, imageTag),
 				dagger.ContainerPublishOpts{PlatformVariants: imgs},
 			)
 			if err != nil {
-				fmt.Printf("Failed to publish image: %s/%s/%s:%s\n", registry, "harbor-next", pkg, imageTag)
+				fmt.Printf("Failed to publish image: %s/%s/%s:%s\n", registry, projectName, pkg, imageTag)
 				fmt.Printf("Error: %s\n", err)
 				continue
 			}
@@ -224,18 +226,41 @@ func (m *Harbor) BuildAllImages(ctx context.Context) []*dagger.Container {
 }
 
 func (m *Harbor) buildAllImages(ctx context.Context) []*BuildMetadata {
-	var buildMetadata []*BuildMetadata
+	var (
+		buildMetadata []*BuildMetadata // final result
+		mu            sync.Mutex       // protects buildMetadata
+		wg            sync.WaitGroup   // waits for all goroutines
+	)
+
 	for _, platform := range targetPlatforms {
 		for _, pkg := range packages {
-			img := m.BuildImage(ctx, platform, pkg)
-			buildMetadata = append(buildMetadata, &BuildMetadata{
-				Package:    pkg,
-				BinaryPath: fmt.Sprintf("bin/%s/%s", platform, pkg),
-				Container:  img,
-				Platform:   platform,
-			})
+			wg.Add(1) // increment WaitGroup counter
+
+			// capture loop variables
+			platform := platform
+			pkg := pkg
+
+			go func() {
+				defer wg.Done() // decrement WaitGroup when done
+
+				img := m.BuildImage(ctx, platform, pkg)
+
+				metadata := &BuildMetadata{
+					Package:    pkg,
+					BinaryPath: fmt.Sprintf("bin/%s/%s", platform, pkg),
+					Container:  img,
+					Platform:   platform,
+				}
+
+				// lock before appending to the shared slice
+				mu.Lock()
+				buildMetadata = append(buildMetadata, metadata)
+				mu.Unlock()
+			}()
 		}
 	}
+
+	wg.Wait() // wait for all goroutines to finish
 	return buildMetadata
 }
 
@@ -348,7 +373,7 @@ func (m *Harbor) buildImage(ctx context.Context, platform Platform, pkg Package)
 			fmt.Println(entrycmd)
 
 			img = img.
-				WithExec([]string{"apk", "add", "delve=1.23.1-r2"}).
+				WithExec([]string{"apk", "add", "delve=1.23.1-r4"}).
 				WithExposedPort(8080).
 				// should use script since executing with config would result in an error
 				WithFile("/entrypoint.sh", m.OnlyDagger.File("./.dagger/config/debug_entrypoint.sh")).
@@ -412,14 +437,14 @@ func (m *Harbor) buildBinary(ctx context.Context, platform Platform, pkg Package
 		log.Fatalf("Error parsing platform: %v", err)
 	}
 
-	srcWithSwagger = m.genAPIs(ctx)
-	m.FilteredSrc = m.FilteredSrc.WithDirectory("/src/server/v2.0", srcWithSwagger)
-
 	if pkg == "core" {
+		m.lintAPIs(ctx)
+		srcWithSwagger = m.genAPIs(ctx)
+		m.FilteredSrc = m.FilteredSrc.WithDirectory("/src/server/v2.0", srcWithSwagger)
+
 		gitCommit := m.fetchGitCommit(ctx)
 		version := m.getVersion(ctx)
 
-		m.lintAPIs(ctx)
 		// srcWithSwagger = m.genAPIs(ctx)
 		// m.Source = srcWithSwagger
 		ldflags = fmt.Sprintf(`-X github.com/goharbor/harbor/src/pkg/version.GitCommit=%s
@@ -542,7 +567,7 @@ func (m *Harbor) buildPortal(ctx context.Context, platform Platform) *dagger.Con
 
 	before := dag.Container().
 		From("oven/bun:1.2.4").
-		WithMountedCache(USER_HOME_DIR+"/.bun/install/cache", dag.CacheVolume("bun")).
+		WithMountedCache("/root/.bun/install/cache", dag.CacheVolume("bun")).
 		WithMountedCache("/root/.npm", dag.CacheVolume("node-16")).
 		WithMountedCache("/root/.angular", dag.CacheVolume("angular")).
 		// for better caching
@@ -633,7 +658,7 @@ func (m *Harbor) genAPIs(_ context.Context) *dagger.Directory {
 		WithWorkdir("/src").
 		WithExec([]string{"swagger", "version"}).
 		// Clean up old generated code and create necessary directories
-		WithExec([]string{"rm", "-rf", TARGET_DIR + "/{models,restapi}"}).
+		// WithExec([]string{"rm", "-rf", TARGET_DIR + "/{models,restapi}"}).
 		WithExec([]string{"mkdir", "-p", TARGET_DIR}).
 		// Generate the server files using the Swagger tool
 		WithExec([]string{"swagger", "generate", "server", "--template-dir=./tools/swagger/templates", "--exclude-main", "--additional-initialism=CVE", "--additional-initialism=GC", "--additional-initialism=OIDC", "-f", SWAGGER_SPEC, "-A", APP_NAME, "--target", TARGET_DIR}).
